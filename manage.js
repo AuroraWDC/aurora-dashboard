@@ -10,7 +10,7 @@ let cf = { p: '', k: '' }, files = [];
 const ROUTES = [['work', 'Work'], ['metrics', 'Metrics'], ['control', 'Control center'], ['upload', 'Upload'], ['activity', 'Activity'], ['settings', 'Settings']];
 const rid = () => 'h' + [...crypto.getRandomValues(new Uint8Array(5))].map(b => b.toString(16).padStart(2, '0')).join('');
 const persist = () => { sessionStorage.setItem('aurora.queue', JSON.stringify(Q)); sessionStorage.setItem('aurora.pub', JSON.stringify(PUB)); };
-const who = () => localStorage.getItem('aurora.who') || '';
+const who = () => A.me?.name || localStorage.getItem('aurora.who') || '';   // personal logins name you automatically
 const token = () => sessionStorage.getItem('aurora.tk') || '';
 const isTyping = () => { const a = document.activeElement; return a && $('#app').contains(a) && /INPUT|TEXTAREA|SELECT/.test(a.tagName); };
 
@@ -61,11 +61,14 @@ function applyLocal(o) {
     else if (o.entity === 'metric') D.metrics.push({ ...structuredClone(base), id: o.id, name: 'Metric', unit: '', target: null, current: null, baseline: null, direction: 'up', owner: null, description: '', period: '', ...f });
     return;
   }
+  if (o.op === 'restore') { D.deleted = D.deleted.filter(x => x.id !== o.id); return; }   // reappears after the next publish
   const e = find(o.entity, o.id); if (!e) return;
   if (o.op === 'set') for (const [k, v] of Object.entries(f)) { mark(e, k); e[k] = v; }
   if (o.op === 'unset') for (const k of o.fields || []) { if (e._pre?.[k]) { const [v, s] = e._pre[k]; e[k] = v; e._src[k] = s; delete e._pre[k]; e._lock = e._lock.filter(x => x !== k); } }
   if (o.op === 'delete') {
-    if (o.entity === 'project') { mark(e, 'archived'); e.archived = true; }
+    if (o.entity === 'project' && o.hard) { D.projects.splice(D.projects.indexOf(e), 1); D.deleted.push({ id: e.id, name: e.name, at: A.today(), pending: true });
+      const ids = new Set(e.tasks.map(t => t.id)); D.projects.forEach(q => { q.depends_on = q.depends_on.filter(x => x !== e.id); q.tasks.forEach(t => t.depends_on = t.depends_on.filter(x => !ids.has(x))); }); }
+    else if (o.entity === 'project') { mark(e, 'archived'); e.archived = true; }
     else if (o.entity === 'metric') { D.metrics.splice(D.metrics.indexOf(e), 1); D.projects.forEach(p => p.metrics = p.metrics.filter(l => l.metric !== e.id)); }
     else { const p = ownerOf(o.entity, o.id), L = o.entity === 'task' ? p.tasks : p.milestones; L.splice(L.indexOf(e), 1);
       if (o.entity === 'task') D.projects.forEach(q => q.tasks.forEach(t => t.depends_on = t.depends_on.filter(x => x !== e.id))); }
@@ -92,7 +95,7 @@ async function save() {
   try {
     const r = await fetch(`https://api.github.com/repos/${A.DATA_REPO}/contents/ops/${id}.json`, { method: 'PUT',
       headers: { Authorization: 'Bearer ' + token(), Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' },
-      body: JSON.stringify({ message: `Workbench edit by ${who()} (${ops.length} change${ops.length === 1 ? '' : 's'})`, content: utf8b64(JSON.stringify({ by: who(), at: new Date().toISOString(), ops }, null, 1)) }) });
+      body: JSON.stringify({ message: `Workbench edit by ${who()} (${ops.length} change${ops.length === 1 ? '' : 's'})`, content: utf8b64(JSON.stringify({ by: who(), email: A.me?.name ? A.me.email : undefined, at: new Date().toISOString(), ops }, null, 1)) }) });
     if (!r.ok) throw new Error([401, 403, 404].includes(r.status) ? 'GitHub rejected the token, or it cannot write to the data repo. Check it in Settings.' : `GitHub returned an error (${r.status}). Try again.`);
     Q = Q.slice(ops.length); PUB.push({ id, ops }); persist(); startPoll();
   } catch (e) { alert(e.message || 'Network error. Check your connection and try again.'); }
@@ -122,7 +125,7 @@ function draw() {
   if (r === 'upload') bindUpload(); if (r === 'work' && wview === 'board') bindBoard();
   window.scrollTo(0, y); saveBar();
 }
-const dl = () => `<datalist id="ppl">${D.peopleNames.map(n => `<option value="${esc(n)}">`).join('')}</datalist>`;
+const dl = () => `<datalist id="ppl">${[...new Set([...D.peopleNames, ...D.users.map(u => u.name)])].sort().map(n => `<option value="${esc(n)}">`).join('')}</datalist>`;
 const opt = (o, v) => Object.entries(o).map(([k, l]) => `<option value="${esc(k)}"${String(v ?? '') === k ? ' selected' : ''}>${esc(l)}</option>`).join('');
 const PRI = { '': '–', 1: 'P1', 2: 'P2', 3: 'P3', 4: 'P4' };
 const unsetBtn = (kind, e, f, p) => e._lock?.includes(f) && e._pre?.[f] ? `<button type="button" class="quiet small" data-act="unset" data-e="${kind}" data-id="${esc(e.id)}" data-f="${f}"${p ? ` data-p="${esc(p)}"` : ''} title="Undo the manual edit and go back to the meeting or agent value">Revert</button>` : '';
@@ -137,7 +140,8 @@ function work() {
   const p = D.P.get(sel);
   return `${dl()}<div class="wb"><aside><form id="np" class="bar" style="margin-bottom:8px"><input name="n" placeholder="New project name" aria-label="New project name" required style="flex:1;min-width:0"><button>Add</button></form>
   <nav class="plist" aria-label="Projects">${ps.map(x => `<a href="#work/${esc(x.id)}"${x.id === sel ? ' aria-current="true"' : ''}><span>${esc(x.name)}${x.archived ? ' <span class="mute small">(archived)</span>' : ''}</span>${A.pill(x.healthNow)}</a>`).join('') || '<p class="empty" style="padding:12px">No projects yet.</p>'}</nav>
-  <label class="small mute" style="display:block;margin-top:8px"><input type="checkbox" data-act="arch"${showArch ? ' checked' : ''}> Show archived</label></aside>
+  <label class="small mute" style="display:block;margin-top:8px"><input type="checkbox" data-act="arch"${showArch ? ' checked' : ''}> Show archived</label>
+  ${D.deleted.length ? `<details style="margin-top:10px"><summary class="small mute">Deleted projects (${D.deleted.length})</summary><ul class="plain small">${D.deleted.map(x => `<li>${esc(x.name)} ${x.pending ? '<span class="mute">(deleting)</span>' : `<button type="button" class="quiet small" data-act="restore" data-id="${esc(x.id)}">Restore</button>`}</li>`).join('')}</ul></details>` : ''}</aside>
   <section>${p ? editor(p) : '<p class="empty">Add a project, or upload a transcript to have one extracted.</p>'}</section></div>`;
 }
 function editor(p) {
@@ -159,6 +163,7 @@ function editor(p) {
    ${field('Description', 'project', p, 'description', `<textarea data-e="project" data-id="${esc(p.id)}" data-f="description" data-t="text">${esc(p.description)}</textarea>`, true)}
   </div>
   <p class="small"><label><input type="checkbox" data-e="project" data-id="${esc(p.id)}" data-f="archived" data-t="bool"${p.archived ? ' checked' : ''}> Archived (hidden from leadership views)</label>
+   <button type="button" class="quiet danger" data-act="delproj" data-id="${esc(p.id)}" style="margin-left:12px">Delete project</button>
    ${others.length ? `<span style="margin-left:18px">Merge into <select id="mergeTo" aria-label="Merge into project"><option value="">Choose a project</option>${others.map(x => `<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('')}</select> <button type="button" data-act="merge" data-id="${esc(p.id)}">Merge</button></span>` : ''}</p></div>
 
   <h3 class="sec">People and roles ${A.srcMark(p, 'team')}${unsetBtn('project', p, 'team')}</h3>
@@ -349,7 +354,8 @@ function describe(o) {
   const nm = (k, id) => k === 'project' ? pname(id) : k === 'task' ? (D.T.get(id)?.text || 'a task') : k === 'metric' ? (D.K.get(id)?.name || 'a metric') : 'a milestone';
   if (o.op === 'set') return `Edited ${o.entity} "${nm(o.entity, o.id)}": ${Object.keys(o.fields || {}).join(', ')}`;
   if (o.op === 'create') return `Added ${o.entity} "${(o.fields || {}).name || (o.fields || {}).text || (o.fields || {}).title || ''}"`;
-  if (o.op === 'delete') return `${o.entity === 'project' ? 'Archived' : 'Deleted'} ${o.entity} "${nm(o.entity, o.id)}"`;
+  if (o.op === 'delete') return `${o.entity === 'project' ? (o.hard ? 'Deleted' : 'Archived') : 'Deleted'} ${o.entity} "${o.name || nm(o.entity, o.id)}"`;
+  if (o.op === 'restore') return `Restored project "${o.name || o.id}"`;
   if (o.op === 'unset') return `Reverted ${(o.fields || []).join(', ')} on ${o.entity} "${nm(o.entity, o.id)}"`;
   if (o.op === 'merge') return `Merged project ${o.from} into "${pname(o.into)}"`;
   if (o.op === 'decision') return `${{ approve: 'Approved', reject: 'Rejected', revert: 'Reverted' }[o.action] || o.action} an agent decision`;
@@ -370,7 +376,7 @@ function settings() {
   const F = D.settings.features;
   return `<h2 class="page">Settings</h2>
   <div class="cols"><div class="panel"><h3 class="sec" style="margin-top:0">You</h3><div class="form">
-   <label class="wide">Your name (shown in the activity log)<input id="who" value="${esc(who())}" autocomplete="name"></label><p id="whomsg" class="err small"></p>
+   ${A.me?.name ? `<p class="wide">Signed in as <b>${esc(A.me.name)}</b> (${esc(A.me.email)}). Your edits are recorded under this name.</p>` : `<label class="wide">Your name (shown in the activity log)<input id="who" value="${esc(who())}" autocomplete="name"></label>`}<p id="whomsg" class="err small"></p>
    <label class="wide">GitHub token<input id="tk" type="password" autocomplete="off" value="${esc(token())}"></label><p id="tkmsg" class="err small"></p></div>
    <p class="small mute">A fine-grained token that can only access ${esc(A.DATA_REPO)}, with Contents read and write. It stays in this browser tab and is cleared when you sign out or close the tab. Anyone holding it can read the raw transcripts, so give tokens only to trusted people.</p>
    <button class="go" data-act="me">Save</button> <span id="mesaved" class="small mute" role="status"></span></div>
@@ -378,6 +384,8 @@ function settings() {
    <p class="small">Keep these off for a simple list of tasks with owners, due dates and dependencies.</p>
    <label style="display:block;margin:8px 0"><input type="checkbox" data-act="feat" data-k="agile"${F.agile ? ' checked' : ''}> <b>Agile</b>: story points, sprints and a drag-and-drop board</label>
    <label style="display:block;margin:8px 0"><input type="checkbox" data-act="feat" data-k="waterfall"${F.waterfall ? ' checked' : ''}> <b>Waterfall</b>: phases, start dates, day estimates, a Gantt timeline and the critical path</label>
+   <h3 class="sec">Dates from meetings and the agent</h3>
+   <label class="small">Add <input type="number" min="0" max="30" step="1" data-act="buffer" value="${esc(D.settings.date_buffer_days ?? 3)}" style="width:64px" aria-label="Extra days"> extra days to each new due date and milestone date that comes from a meeting or the agent. Dates that land on a weekend move to Monday. Dates you type yourself are never changed, and existing dates stay as they are.</label>
    <label style="display:block;margin-top:14px" class="small mute">Organisation name<input data-act="org" value="${esc(D.settings.org)}" style="display:block;width:100%"></label>
    <p class="small mute">Feature and agent settings are saved like any other edit, with Save and publish.</p></div></div>`;
 }
@@ -413,12 +421,17 @@ function onChange(e) {
   if (act === 'cfp') { cf.p = el.value; draw(); } if (act === 'cfk') { cf.k = el.value; draw(); }
   if (act === 'minconf') queue({ op: 'settings', fields: { auto_min_confidence: Math.min(100, Math.max(0, +el.value || 0)) / 100 } }, false);
   if (act === 'feat') queue({ op: 'settings', fields: { features: { [ds.k]: el.checked } } });
+  if (act === 'buffer' && el.value !== '') queue({ op: 'settings', fields: { date_buffer_days: Math.min(30, Math.max(0, parseInt(el.value, 10) || 0)) } }, false);
   if (act === 'org' && el.value.trim()) queue({ op: 'settings', fields: { org: el.value.trim() } }, false);
 }
 function onClick(e) {
   const b = e.target.closest('[data-act]'); if (!b || b.tagName === 'SELECT' || b.tagName === 'INPUT') return; const ds = b.dataset;
   switch (ds.act) {
     case 'wview': wview = ds.v; draw(); break;
+    case 'delproj': { const p = D.P.get(ds.id);
+      if (confirm(`Delete "${p.name}" for everyone?\n\nIts tasks, milestones and links are removed from the dashboard, and later meetings that mention it will not bring it back. You can restore it from "Deleted projects" in the sidebar. To hide it but keep it, use Archived instead.`)) {
+        queue({ op: 'delete', entity: 'project', id: p.id, hard: true, name: p.name }); sel = null; location.hash = 'work'; } break; }
+    case 'restore': { const x = D.deleted.find(d => d.id === ds.id); queue({ op: 'restore', entity: 'project', id: ds.id, name: x?.name }); break; }
     case 'del': if (confirm(`Delete this ${ds.e}?`)) queue({ op: 'delete', entity: ds.e, id: ds.id }); break;
     case 'unset': queue({ op: 'unset', entity: ds.e, id: ds.id, fields: ds.f.split(',').filter(Boolean) }); break;
     case 'team-del': { const p = D.P.get(sel); queue({ op: 'set', entity: 'project', id: p.id, fields: { team: p.team.filter((_, i) => i !== +ds.i) } }); break; }
@@ -433,7 +446,7 @@ function onClick(e) {
     case 'preset': queue({ op: 'settings', fields: PRESETS[ds.v].s }); break;
     case 'auto': queue({ op: 'settings', fields: { autonomy: { [ds.k]: ds.v } } }); break;
     case 'run': queue({ op: 'run_agent' }); save(); break;
-    case 'me': localStorage.setItem('aurora.who', $('#who').value.trim()); sessionStorage.setItem('aurora.tk', $('#tk').value.trim()); $('#mesaved').textContent = 'Saved.'; $('#tkmsg').textContent = ''; $('#whomsg').textContent = ''; break;
+    case 'me': if ($('#who')) localStorage.setItem('aurora.who', $('#who').value.trim()); sessionStorage.setItem('aurora.tk', $('#tk').value.trim()); $('#mesaved').textContent = 'Saved.'; $('#tkmsg').textContent = ''; $('#whomsg').textContent = ''; break;
   }
 }
 function onSubmit(e) {

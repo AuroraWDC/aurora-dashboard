@@ -7,7 +7,10 @@
 const MAX_MS = 5 * 60 * 1000, MIN_MS = 1500;
 const hex = n => [...crypto.getRandomValues(new Uint8Array(n))].map(b => b.toString(16).padStart(2, '0')).join('');
 const get = (store, k, make) => { let v = store.getItem(k); if (!v) { v = make(); store.setItem(k, v); } return v; };
-const person = get(localStorage, 'aurora.fb.person', () => hex(4));                 // same browser = same person
+const device = get(localStorage, 'aurora.fb.person', () => hex(4));
+// signed in with a personal login: group by that person's email; old shared login: group by browser
+const person = () => window.A?.me?.name ? window.A.me.email.replace(/[^a-z0-9._-]+/gi, '_') : device;
+const myName = () => window.A?.me?.name || localStorage.getItem('aurora.who') || '';
 const session = get(sessionStorage, 'aurora.fb.session', () => hex(3));             // one tab visit = one session
 const sessionStart = get(sessionStorage, 'aurora.fb.started', () => new Date().toISOString());
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -117,21 +120,21 @@ async function put(path, content, message) {
 }
 async function send() {
   show('<h4>Sending…</h4><p>Saving your recording.</p>');
-  const L = last, stamp = L.at.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z'), base = `recordings/${person}/${stamp}-${session}`;
-  const meta = { person, session, session_started: sessionStart, name: localStorage.getItem('aurora.who') || null, at: L.at.toISOString(),
+  const L = last, stamp = L.at.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z'), base = `recordings/${person()}/${stamp}-${session}`;
+  const meta = { person: person(), email: window.A?.me?.name ? window.A.me.email : null, session, session_started: sessionStart, name: myName() || null, at: L.at.toISOString(),
     duration_ms: L.ms, audio: `${stamp}-${session}.${L.ext}`, mime: L.blob.type, ...L.ctx, browser: navigator.userAgent.slice(0, 160) };
   try {
     await put(base + '.json', b64txt(JSON.stringify(meta, null, 1)), `Feedback context (${meta.page}, ${meta.view})`);
     await put(`${base}.${L.ext}`, await b64(L.blob), `Feedback recording (${meta.page}, ${meta.view}, ${mmss(L.ms)})`);
     last = null;
-    const name = localStorage.getItem('aurora.who') || '';
+    const name = myName();
     show(`<h4>Thank you, your feedback was saved</h4><p>It will be transcribed in a few minutes.${name ? '' : ' If you like, add your name so your recordings are grouped under it.'}</p>
       ${name ? '' : '<div class="fb-row"><input id="fbn" placeholder="Your name (optional)" aria-label="Your name (optional)" autocomplete="name" style="flex:1;min-width:0"><button type="button" data-n>Save name</button></div>'}
       <div class="fb-row" style="margin-top:8px"><button type="button" class="quiet" data-x>Close</button></div>`);
     panel.querySelector('[data-x]').onclick = hide;
     const n = panel.querySelector('[data-n]');
     if (n) n.onclick = async () => { const v = panel.querySelector('#fbn').value.trim(); if (!v) return; localStorage.setItem('aurora.who', v);
-      try { await put(`recordings/${person}/name-${new Date().toISOString().replace(/[-:.]/g, '')}.json`, b64txt(JSON.stringify({ name: v, at: new Date().toISOString() })), 'Feedback name'); } catch {}
+      try { await put(`recordings/${person()}/name-${new Date().toISOString().replace(/[-:.]/g, '')}.json`, b64txt(JSON.stringify({ name: v, at: new Date().toISOString() })), 'Feedback name'); } catch {}
       show('<h4>Thanks, ' + esc(v) + '</h4><p>Your recordings are grouped under your name.</p><button type="button" class="quiet" data-x>Close</button>'); panel.querySelector('[data-x]').onclick = hide; };
   } catch (e) {
     const url = URL.createObjectURL(L.blob);

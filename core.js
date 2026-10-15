@@ -25,39 +25,68 @@ A.KINDS = {
 };
 
 /* ---------- sign-in and data ---------- */
-let KEY = null;
+/* Two formats are understood:
+   v3 (per-person logins): the data is locked with a random key, and the file holds one copy of that key for each person,
+      locked with a key derived from their own email+password. Cached in this tab: the person's key and lookup id.
+   v2 (old shared login): the data is locked directly with a key from username+password. */
+let AUTH = null;
+const enc = s => new TextEncoder().encode(s);
 async function fetchEnc() { const r = await fetch('data.enc.json?t=' + Date.now(), { cache: 'no-store' }); if (!r.ok) throw new Error('nodata'); return r.json(); }
 async function decryptWith(key, p) { return JSON.parse(new TextDecoder().decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64d(p.iv) }, key, b64d(p.ct)))); }
-async function deriveKey(user, pw, p) {
-  const km = await crypto.subtle.importKey('raw', new TextEncoder().encode(user.trim().toLowerCase() + ':' + pw), 'PBKDF2', false, ['deriveKey']);
-  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt: b64d(p.salt), iterations: p.iter, hash: 'SHA-256' }, km, { name: 'AES-GCM', length: 256 }, true, ['decrypt']);
+async function pbkdf2(user, pw, salt, iter) {
+  const km = await crypto.subtle.importKey('raw', enc(user.trim().toLowerCase() + ':' + pw), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: iter, hash: 'SHA-256' }, km, { name: 'AES-GCM', length: 256 }, true, ['decrypt']);
 }
+async function lookupOf(email) {
+  const h = new Uint8Array(await crypto.subtle.digest('SHA-256', enc('aurora-login:' + email)));
+  return [...h].map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 32);
+}
+async function openWith(auth, p) {
+  if ((p.v || 0) < 3) { if (auth.kind !== 'v2') throw new Error('format'); return decryptWith(auth.key, p); }
+  if (auth.kind !== 'v3') throw new Error('format');
+  const u = p.users?.[auth.lk]; if (!u) throw new Error('no user');
+  const raw = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64d(u.iv), additionalData: enc(auth.lk) }, auth.key, b64d(u.k));
+  return decryptWith(await crypto.subtle.importKey('raw', raw, 'AES-GCM', false, ['decrypt']), p);
+}
+async function signIn(email, pw, p) {
+  if ((p.v || 0) >= 3) {
+    const lk = await lookupOf(email), u = p.users?.[lk];
+    if (!u) throw new Error('no user');
+    return { kind: 'v3', lk, key: await pbkdf2(email, pw, b64d(u.salt), p.iter) };
+  }
+  return { kind: 'v2', key: await pbkdf2(email, pw, b64d(p.salt), p.iter) };
+}
+const nameOf = email => email.includes('@') ? email.split('@')[0].split(/[._\-+]+/).filter(Boolean).map(w => w[0].toUpperCase() + w.slice(1)).join(' ') : null;
 A.boot = async onReady => {
   const lock = $('#lock'), err = $('#err');
   let p;
   try { p = await fetchEnc(); } catch { lock.hidden = false; $('#f').hidden = true; err.textContent = 'No dashboard data has been published yet. Add a transcript or save an edit to create it.'; return; }
-  const cached = sessionStorage.getItem('aurora.key');
+  const cached = sessionStorage.getItem('aurora.auth');
   if (cached) {
-    try { KEY = await crypto.subtle.importKey('raw', b64d(cached), 'AES-GCM', true, ['decrypt']); return start(await decryptWith(KEY, p), onReady); }
-    catch { sessionStorage.removeItem('aurora.key'); KEY = null; }
+    try { const c = JSON.parse(cached); const auth = { kind: c.kind, lk: c.lk, key: await crypto.subtle.importKey('raw', b64d(c.key), 'AES-GCM', true, ['decrypt']) };
+      const d = await openWith(auth, p); AUTH = auth; setMe(c.email); return start(d, onReady); }
+    catch { sessionStorage.removeItem('aurora.auth'); AUTH = null; }
   }
   lock.hidden = false; $('#u').focus();
   $('#f').onsubmit = async e => {
     e.preventDefault(); err.textContent = ''; const btn = $('#f button'); btn.disabled = true; btn.textContent = 'Signing in…';
+    const email = $('#u').value.trim().toLowerCase();
     try {
-      const key = await deriveKey($('#u').value, $('#pw').value, p); const d = await decryptWith(key, p);
-      KEY = key; sessionStorage.setItem('aurora.key', b64e(await crypto.subtle.exportKey('raw', key)));
+      const auth = await signIn(email, $('#pw').value, p), d = await openWith(auth, p);
+      AUTH = auth; setMe(email);
+      sessionStorage.setItem('aurora.auth', JSON.stringify({ kind: auth.kind, lk: auth.lk, email, key: b64e(await crypto.subtle.exportKey('raw', auth.key)) }));
       $('#pw').value = ''; start(d, onReady);
-    } catch { err.textContent = 'Incorrect username or password.'; }
+    } catch { err.textContent = 'Incorrect email or password.'; }
     btn.disabled = false; btn.textContent = 'Sign in';
   };
 };
+function setMe(email) { A.me = { email, name: nameOf(email) }; }   // name is null for the old shared login
 function start(d, onReady) {
   $('#lock').hidden = true; $('#app').hidden = false; $('#nav').hidden = false;
   const D = A._D = A.derive(A.normalize(d)); A.FB = d.feedback?.token ? d.feedback : null;
   onReady(D); document.dispatchEvent(new CustomEvent('aurora:ready'));
 }
-A.refresh = async () => { const d = await decryptWith(KEY, await fetchEnc()); A.FB = d.feedback?.token ? d.feedback : A.FB; return (A._D = A.derive(A.normalize(d))); };
+A.refresh = async () => { const d = await openWith(AUTH, await fetchEnc()); A.FB = d.feedback?.token ? d.feedback : A.FB; return (A._D = A.derive(A.normalize(d))); };
 A.currentProjectName = id => A._D?.P.get(id)?.name || A._D?.P.get(A._D.alias?.[id])?.name || null;
 A.signOut = () => { sessionStorage.clear(); location.href = location.pathname; };
 
@@ -65,7 +94,7 @@ A.signOut = () => { sessionStorage.clear(); location.href = location.pathname; }
 A.normalize = D => {
   D.settings = Object.assign({ org: 'Aurora WDC', features: {}, autonomy: {}, agent_enabled: false, auto_min_confidence: .75 }, D.settings || {});
   D.settings.features = Object.assign({ agile: false, waterfall: false }, D.settings.features);
-  for (const k of ['metrics', 'decisions', 'conflicts', 'history', 'ops_applied', 'ops_log', 'agent_runs', 'op_errors', 'op_failures', 'meetings']) D[k] ||= [];
+  for (const k of ['metrics', 'decisions', 'conflicts', 'history', 'ops_applied', 'ops_log', 'agent_runs', 'op_errors', 'op_failures', 'meetings', 'deleted', 'users']) D[k] ||= [];
   D.projects.forEach((p, i) => {
     p.id ||= 'v1p' + i; p.tasks ||= []; p.milestones ||= []; p.metrics ||= []; p.depends_on ||= []; p._src ||= {}; p._lock ||= []; p._pre ||= {};
     p.team = (p.team || []).map(t => typeof t === 'string' ? { name: t, role: '' } : t);
@@ -156,7 +185,7 @@ A.derive = D => {
       if (t.blockers.length && t.due && t.blockers.some(b => b.due && b.due > t.due)) D.alerts.push({ p, t, type: 'Sequencing', text: `${t.text} is due before a task it waits on` });
     });
   });
-  D.proposed = D.decisions.filter(d => d.state === 'proposed');
+  D.proposed = D.decisions.filter(d => d.state === 'proposed' && (D.P.has(d.project) || D.P.has(D.alias?.[d.project])));
   return D;
 };
 
