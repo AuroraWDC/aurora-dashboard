@@ -3,7 +3,7 @@
    and derive() adds the computed views: health, progress, sequencing, critical path, people, alerts. */
 'use strict';
 const A = window.A = {};
-const DATA_REPO = A.DATA_REPO = 'electricarchmage/aurora-dashboard-data'; // private repo with transcripts and edits
+const DATA_REPO = A.DATA_REPO = 'AuroraWDC/aurora-dashboard-data'; // private repo with transcripts and edits
 const $ = A.$ = (s, r = document) => r.querySelector(s);
 const $$ = A.$$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = A.esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
