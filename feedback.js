@@ -1,7 +1,9 @@
 /* Voice feedback: one button on every page. Records from the microphone, then saves the audio plus a small
    context file (page, view, person, session) to the private aurora-feedback repo. A GitHub Action there
    transcribes it with Groq Whisper and keeps FEEDBACK.md up to date, grouped by person and session.
-   The upload token arrives inside the encrypted dashboard data, so only signed-in users can send feedback. */
+   The upload token arrives inside the encrypted dashboard data, so only signed-in users can send feedback.
+   V2.3: the same button carries tool feedback and spoken project updates; transcribe.py sorts one from the other and
+   forwards updates to the data repo as voice-note transcripts. */
 'use strict';
 (() => {
 const MAX_MS = 5 * 60 * 1000, MIN_MS = 1500;
@@ -71,7 +73,7 @@ async function start() {
   rec.start(1000); t0 = Date.now();
   btn.setAttribute('aria-pressed', 'true'); btn.querySelector('span').textContent = 'Stop and send';
   show(`<div class="fb-row"><span class="fb-dot"></span><b>Recording</b><span class="fb-time" id="fbt">0:00</span><span class="fb-meter"><span id="fbm"></span></span></div>
-    <p>Say what could be better on this page, or anywhere in the dashboard. Press Stop and send when you are done.</p>
+    <p>Two things work here: feedback on the tool ("this screen is confusing"), or an update to the work ("this task is done, Greg owns it, the deadline moved to Friday"). Updates are applied to the project you are looking at. Press Stop and send when you are done.</p>
     <div class="fb-row"><button type="button" class="go" data-s>Stop and send</button><button type="button" class="quiet" data-c>Cancel</button></div>`);
   panel.querySelector('[data-s]').onclick = stop; panel.querySelector('[data-c]').onclick = cancel;
   tick = setInterval(() => { const ms = Date.now() - t0; const el = document.getElementById('fbt'); if (el) el.textContent = mmss(ms); if (ms >= MAX_MS) stop(); }, 250);
@@ -128,7 +130,7 @@ async function send() {
     await put(`${base}.${L.ext}`, await b64(L.blob), `Feedback recording (${meta.page}, ${meta.view}, ${mmss(L.ms)})`);
     last = null;
     const name = myName();
-    show(`<h4>Thank you, your feedback was saved</h4><p>It will be transcribed in a few minutes.${name ? '' : ' If you like, add your name so your recordings are grouped under it.'}</p>
+    show(`<h4>Thank you, your recording was saved</h4><p>It is transcribed in a few minutes. Tool feedback goes to the people building the dashboard; anything about the work itself is passed to the dashboard as an update (visible on the project page after the next refresh).${name ? '' : ' If you like, add your name so your recordings are grouped under it.'}</p>
       ${name ? '' : '<div class="fb-row"><input id="fbn" placeholder="Your name (optional)" aria-label="Your name (optional)" autocomplete="name" style="flex:1;min-width:0"><button type="button" data-n>Save name</button></div>'}
       <div class="fb-row" style="margin-top:8px"><button type="button" class="quiet" data-x>Close</button></div>`);
     panel.querySelector('[data-x]').onclick = hide;
