@@ -1,4 +1,6 @@
 /* Workbench interface (manage.html): edit the work, review and override the PM agent, upload transcripts.
+   V2.3: work type per project, share of time per team member, people's capacity and the operational/innovation
+   target in Settings, uploads that can be tied to a project (manage.html#upload/<project id>).
    Edits are queued in this tab, shown immediately, then saved as one file in the private repo's ops/ folder.
    That push runs the pipeline, which republishes the dashboard for everyone (usually 1-3 minutes). */
 'use strict';
@@ -6,7 +8,7 @@
 const { $, $$, esc } = A;
 const ss = (k, d) => { try { return JSON.parse(sessionStorage.getItem(k)) ?? d; } catch { return d; } };
 let D, Q = ss('aurora.queue', []), PUB = ss('aurora.pub', []), sel = null, wview = 'list', showArch = false, pollT = null, dirty = false;
-let cf = { p: '', k: '' }, files = [];
+let cf = { p: '', k: '' }, files = [], upFor = '';
 const ROUTES = [['work', 'Work'], ['metrics', 'Metrics'], ['control', 'Control center'], ['upload', 'Upload'], ['activity', 'Activity'], ['settings', 'Settings']];
 const rid = () => 'h' + [...crypto.getRandomValues(new Uint8Array(5))].map(b => b.toString(16).padStart(2, '0')).join('');
 const persist = () => { sessionStorage.setItem('aurora.queue', JSON.stringify(Q)); sessionStorage.setItem('aurora.pub', JSON.stringify(PUB)); };
@@ -44,7 +46,12 @@ function mark(e, f) { e._src ||= {}; e._lock ||= []; e._pre ||= {};
 const KF = { set_project_status: ['project', 'status'], set_project_owner: ['project', 'owner'], set_task_owner: ['task', 'assignee'], set_task_due: ['task', 'due'], set_task_status: ['task', 'status'], set_workstream: ['task', 'workstream'], set_priority: ['either', 'priority'] };
 function applyLocal(o) {
   const t0 = A.today(), base = { _src: {}, _lock: [], _pre: {} };
-  if (o.op === 'settings') { const f = o.fields || {}; for (const [k, v] of Object.entries(f)) (k === 'features' || k === 'autonomy') ? Object.assign(D.settings[k], v) : (D.settings[k] = v); return; }
+  if (o.op === 'settings') { const f = o.fields || {};
+    for (const [k, v] of Object.entries(f)) {
+      if (k === 'features' || k === 'autonomy') Object.assign(D.settings[k], v);
+      else if (k === 'capacity') { for (const [n, c] of Object.entries(v || {})) { if (c == null || c === '') delete D.settings.capacity[n]; else D.settings.capacity[n] = c; } }
+      else D.settings[k] = v;
+    } return; }
   if (o.op === 'run_agent') return;
   if (o.op === 'decision') { const d = D.decisions.find(x => x.id === o.id); if (!d) return; d.state = { approve: 'approved', reject: 'rejected', revert: 'reverted' }[o.action];
     if (o.action === 'approve' && KF[d.kind]) { const e = d.task ? find('task', d.task) : find('project', d.project); if (e) { e[KF[d.kind][1]] = d.kind === 'set_priority' ? +d.value : d.value; e._src[KF[d.kind][1]] = 'agent:' + d.id; } }
@@ -55,7 +62,7 @@ function applyLocal(o) {
   const f = o.fields || {};
   if (o.op === 'create') {
     if (find(o.entity, o.id)) return applyLocal({ ...o, op: 'set' });
-    if (o.entity === 'project') D.projects.push({ ...structuredClone(base), id: o.id, name: 'Untitled project', status: 'not_started', owner: null, description: '', team: [], tasks: [], milestones: [], metrics: [], depends_on: [], risks: [], assumptions: [], dependencies: [], metrics_mentioned: [], meetings: [], archived: false, priority: null, health: null, updated: t0, first_seen: t0, ...f });
+    if (o.entity === 'project') D.projects.push({ ...structuredClone(base), id: o.id, name: 'Untitled project', status: 'not_started', owner: null, description: '', kind: null, team: [], tasks: [], milestones: [], metrics: [], depends_on: [], risks: [], assumptions: [], dependencies: [], metrics_mentioned: [], meetings: [], archived: false, priority: null, health: null, updated: t0, first_seen: t0, ...f });
     else if (o.entity === 'task') find('project', o.project)?.tasks.push({ ...structuredClone(base), id: o.id, text: 'Untitled task', status: 'open', assignee: null, due: null, depends_on: [], workstream: null, first_seen: t0, seen: t0, ...f });
     else if (o.entity === 'milestone') find('project', o.project)?.milestones.push({ ...structuredClone(base), id: o.id, title: 'Milestone', date: null, done: false, ...f });
     else if (o.entity === 'metric') D.metrics.push({ ...structuredClone(base), id: o.id, name: 'Metric', unit: '', target: null, current: null, baseline: null, direction: 'up', owner: null, description: '', period: '', ...f });
@@ -119,7 +126,7 @@ function draw() {
   $('#nav').innerHTML = ROUTES.map(([k, v]) => `<a href="#${k}"${r === k ? ' aria-current="page"' : ''}>${v}${k === 'control' && D.proposed.length ? ` <span class="chip">${D.proposed.length}</span>` : ''}</a>`).join('') +
     `<a class="switch" href="index.html">Leadership view</a><button id="so">Sign out</button>`;
   $('#so').onclick = () => { if (!Q.length || confirm('You have unsaved changes. Sign out anyway?')) { Q = []; persist(); A.signOut(); } };
-  if (r === 'work' && id) sel = id;
+  if (r === 'work' && id) sel = id; if (r === 'upload') upFor = id && D.P.get(id) ? id : (id ? '' : upFor);
   const y = window.scrollY;
   $('#app').innerHTML = ({ work, metrics, control, upload, activity, settings }[r] || work)();
   if (r === 'upload') bindUpload(); if (r === 'work' && wview === 'board') bindBoard();
@@ -156,6 +163,7 @@ function editor(p) {
    ${field('Owner', 'project', p, 'owner', inp('project', p, 'owner', 'text', 'list="ppl"'))}
    ${field('Priority', 'project', p, 'priority', sel_('project', p, 'priority', PRI))}
    ${field('Health', 'project', p, 'health', sel_('project', p, 'health', { '': `Automatic (${A.HEALTH[p.autoHealth]})`, green: 'On track', amber: 'At risk', red: 'Off track' }))}
+   ${field('Work type', 'project', p, 'kind', sel_('project', p, 'kind', { '': 'Not set', ops: 'Operational (sustains the business)', innovation: 'Innovation (a bet on a future result)' }))}
    ${field('Sponsor', 'project', p, 'sponsor', inp('project', p, 'sponsor', 'text', 'list="ppl"'))}
    ${field('Start', 'project', p, 'start', inp('project', p, 'start', 'date'))}
    ${field('Target date', 'project', p, 'target', inp('project', p, 'target', 'date'))}
@@ -166,10 +174,11 @@ function editor(p) {
    <button type="button" class="quiet danger" data-act="delproj" data-id="${esc(p.id)}" style="margin-left:12px">Delete project</button>
    ${others.length ? `<span style="margin-left:18px">Merge into <select id="mergeTo" aria-label="Merge into project"><option value="">Choose a project</option>${others.map(x => `<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('')}</select> <button type="button" data-act="merge" data-id="${esc(p.id)}">Merge</button></span>` : ''}</p></div>
 
-  <h3 class="sec">People and roles ${A.srcMark(p, 'team')}${unsetBtn('project', p, 'team')}</h3>
-  <div class="panel"><table class="t edit" id="team"><tr><th>Name</th><th>Role on this project</th><th></th></tr>
-   ${p.team.map((t, i) => `<tr><td><input data-team="name" value="${esc(t.name)}" list="ppl" aria-label="Name"></td><td><input data-team="role" value="${esc(t.role)}" aria-label="Role" placeholder="e.g. design lead, approver"></td><td><button type="button" class="quiet danger" data-act="team-del" data-i="${i}" aria-label="Remove ${esc(t.name)}">Remove</button></td></tr>`).join('')}
-   <tr><td><input data-team="name" list="ppl" placeholder="Add a person" aria-label="New person"></td><td><input data-team="role" placeholder="Role" aria-label="New person's role"></td><td></td></tr></table></div>
+  <h3 class="sec">People, roles and staffing ${A.srcMark(p, 'team')}${unsetBtn('project', p, 'team')}</h3>
+  <div class="panel"><table class="t edit" id="team"><tr><th>Name</th><th>Role on this project</th><th title="How much of this person's time the project takes, as a percent">Share of their time</th><th>Their load</th><th></th></tr>
+   ${p.team.map((t, i) => { const st = p.staff.find(x => x.name === t.name); return `<tr><td><input data-team="name" value="${esc(t.name)}" list="ppl" aria-label="Name"></td><td><input data-team="role" value="${esc(t.role)}" aria-label="Role" placeholder="e.g. design lead, approver"></td><td><input data-team="alloc" type="number" min="0" max="300" step="5" value="${t.alloc ?? ''}" placeholder="%" style="width:80px" aria-label="Percent of their time"></td><td class="small">${st ? `<span class="${st.total > st.capacity ? 'late' : 'mute'}">${st.total}% of ${st.capacity}%</span>${st.below ? ' <span class="late">below their line</span>' : ''}` : ''}</td><td><button type="button" class="quiet danger" data-act="team-del" data-i="${i}" aria-label="Remove ${esc(t.name)}">Remove</button></td></tr>`; }).join('')}
+   <tr><td><input data-team="name" list="ppl" placeholder="Add a person" aria-label="New person"></td><td><input data-team="role" placeholder="Role" aria-label="New person's role"></td><td><input data-team="alloc" type="number" min="0" max="300" step="5" placeholder="%" style="width:80px" aria-label="New person's percent of time"></td><td></td><td></td></tr></table>
+   <p class="small mute">"Share of their time" is what this project takes from the person, e.g. 40. Each person's capacity (default 100%) is set in <a href="#settings">Settings</a>. Projects are funded in priority order, so when someone is over capacity their lowest-priority projects fall "below the line".</p></div>
 
   <h3 class="sec">Company metrics it moves ${A.srcMark(p, 'metrics')}</h3>
   <div class="panel">${D.metrics.length ? `<table class="t edit"><tr><th>Metric</th><th>How this project moves it</th></tr>${D.metrics.map(m => { const l = p.metrics.find(x => x.metric === m.id);
@@ -325,14 +334,16 @@ function control() {
 
 /* ---------- Upload ---------- */
 function upload() {
-  return `<h2 class="page">Upload transcripts</h2><p class="lede">Add Teams meeting transcripts (.vtt or .txt). They are saved to the private data repo, and the dashboard updates a few minutes later. Uses the GitHub token from Settings.</p>
+  const ps = D.active.filter(p => p.status !== 'completed').sort((a, b) => a.name.localeCompare(b.name));
+  return `<h2 class="page">Upload transcripts</h2><p class="lede">Add Teams meeting transcripts (.vtt, or .txt copied from the transcript pane). They are saved to the private data repo and processed one after another; the dashboard updates a few minutes after each. Uses the GitHub token from Settings.</p>
   <div class="panel" style="max-width:720px">${token() ? '' : '<p class="notice">Add a GitHub token in <a href="#settings">Settings</a> first.</p>'}
+  <p><label class="small mute">Mainly about <select id="upfor" aria-label="Project this transcript is mainly about"><option value="">No single project (general meeting)</option>${ps.map(p => `<option value="${esc(p.id)}"${upFor === p.id ? ' selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label></p>
   <p><input id="fp" type="file" accept=".vtt,.txt" multiple aria-label="Transcript files"></p><div id="rows"></div>
   <p><button class="go" id="up" disabled>Upload</button> <span id="us" class="mute" role="status"></span></p>
-  <p class="small mute">The date sets "last discussed" and resolves phrases like "next Friday". It is taken from the file name when it contains one.</p></div>`;
+  <p class="small mute">The date sets "last discussed" and resolves phrases like "next Friday"; it is taken from the file name when it contains one, so check it. Naming a project adds it to the file name so the extraction keeps that project's name. Upload several at once if you like: runs queue up, there is no need to wait between files. Do not upload the same transcript twice (an identical copy is skipped anyway).</p></div>`;
 }
 function bindUpload() {
-  const fp = $('#fp'), rows = $('#rows'), up = $('#up');
+  const fp = $('#fp'), rows = $('#rows'), up = $('#up'); $('#upfor').onchange = e => { upFor = e.target.value; };
   fp.onchange = () => { files = [...fp.files].map(f => { const m = f.name.match(/(20\d\d)-?(\d\d)-?(\d\d)/); return { f, d: m ? `${m[1]}-${m[2]}-${m[3]}` : new Date(f.lastModified).toISOString().slice(0, 10) }; });
     rows.innerHTML = files.map((x, i) => `<div class="bar"><span style="flex:1;overflow-wrap:anywhere">${esc(x.f.name)}</span><input type="date" data-i="${i}" value="${x.d}" aria-label="Meeting date for ${esc(x.f.name)}"><span class="mute" id="s${i}"></span></div>`).join('');
     rows.querySelectorAll('input[type=date]').forEach(i => i.onchange = e => files[e.target.dataset.i].d = e.target.value); up.disabled = !files.length; };
@@ -341,7 +352,8 @@ function bindUpload() {
     up.disabled = true;
     for (const [i, x] of files.entries()) { const el = $('#s' + i); el.textContent = 'Uploading…';
       try { const c = await new Promise(r => { const fr = new FileReader(); fr.onload = () => r(fr.result.split(',')[1]); fr.readAsDataURL(x.f); });
-        const n = x.d + '-' + x.f.name.replace(/^\d{4}-?\d{2}-?\d{2}[-_ ]*/, '').replace(/[^\w.-]+/g, '_');
+        const slug = upFor && D.P.get(upFor) ? D.P.get(upFor).name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) + '-' : '';
+        const n = x.d + '-' + slug + x.f.name.replace(/^\d{4}-?\d{2}-?\d{2}[-_ ]*/, '').replace(/[^\w.-]+/g, '_');
         const r = await fetch(`https://api.github.com/repos/${A.DATA_REPO}/contents/transcripts/${encodeURIComponent(n)}`, { method: 'PUT', headers: { Authorization: 'Bearer ' + token(), Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' }, body: JSON.stringify({ message: 'Add transcript ' + n, content: c }) });
         el.textContent = r.ok ? 'Uploaded' : r.status === 422 ? 'Already uploaded' : [401, 403, 404].includes(r.status) ? 'Token rejected or lacks access to the data repo' : 'Failed (' + r.status + ')';
       } catch { el.textContent = 'Network error'; } }
@@ -387,7 +399,13 @@ function settings() {
    <h3 class="sec">Dates from meetings and the agent</h3>
    <label class="small">Add <input type="number" min="0" max="30" step="1" data-act="buffer" value="${esc(D.settings.date_buffer_days ?? 3)}" style="width:64px" aria-label="Extra days"> extra days to each new due date and milestone date that comes from a meeting or the agent. Dates that land on a weekend move to Monday. Dates you type yourself are never changed, and existing dates stay as they are.</label>
    <label style="display:block;margin-top:14px" class="small mute">Organisation name<input data-act="org" value="${esc(D.settings.org)}" style="display:block;width:100%"></label>
-   <p class="small mute">Feature and agent settings are saved like any other edit, with Save and publish.</p></div></div>`;
+   <p class="small mute">Feature and agent settings are saved like any other edit, with Save and publish.</p></div></div>
+  <h3 class="sec">People's capacity <span class="mute">shared with everyone</span></h3>
+  <div class="panel"><p class="small">How much of a full load each person can give to projects, as a percent (100 = all of their project time). Leave blank for 100. A person at 60 who is on projects adding up to 80 is over capacity, and their lowest-priority project falls below the line.
+</p>
+   <table class="t edit" style="max-width:560px"><tr><th>Person</th><th>Capacity %</th><th>Allocated now</th></tr>
+   ${D.people.filter(x => x.roles.size).map(x => `<tr><td>${esc(x.name)}</td><td><input type="number" min="0" max="300" step="5" data-cap="${esc(x.name)}" value="${Object.hasOwn(D.settings.capacity, x.name) ? esc(D.settings.capacity[x.name]) : ''}" placeholder="100" style="width:90px" aria-label="Capacity for ${esc(x.name)}"></td><td class="small ${x.over ? 'late' : 'mute'}">${x.plan.length ? x.alloc + '%' : '–'}</td></tr>`).join('')}</table>
+   <label class="small" style="display:block;margin-top:14px">Target share of staffed effort for operational work: <input type="number" min="0" max="100" step="5" data-act="opstarget" value="${esc(D.settings.ops_target ?? '')}" placeholder="e.g. 80" style="width:80px" aria-label="Operational target percent">% (the rest is for innovation). Leave blank for no target.</label></div>`;
 }
 
 /* ---------- event handling ---------- */
@@ -410,8 +428,8 @@ function onChange(e) {
     const o = { op: 'set', entity: ds.e, id: ds.id, fields: { [ds.f]: v } }; if (ds.p) o.project = ds.p;
     const structural = ['depends_on', 'archived', 'status', 'workstream', 'priority', 'health'].includes(ds.f) || ds.e === 'metric' && ds.f === 'name';
     return queue(o, structural); }
-  if (el.dataset.team !== undefined) { const p = D.P.get(sel), team = $$('#team tr').slice(1).map(r => ({ name: r.querySelector('[data-team=name]').value.trim(), role: r.querySelector('[data-team=role]').value.trim() })).filter(t => t.name);
-    return queue({ op: 'set', entity: 'project', id: p.id, fields: { team } }, el.dataset.team === 'name'); }
+  if (el.dataset.team !== undefined) { const p = D.P.get(sel), team = $$('#team tr').slice(1).map(r => ({ name: r.querySelector('[data-team=name]').value.trim(), role: r.querySelector('[data-team=role]').value.trim(), alloc: r.querySelector('[data-team=alloc]').value === '' ? null : Math.max(0, Math.min(300, Math.round(+r.querySelector('[data-team=alloc]').value))) })).filter(t => t.name);
+    return queue({ op: 'set', entity: 'project', id: p.id, fields: { team } }, el.dataset.team !== 'role'); }
   if (ds.ml !== undefined || ds.mlhow !== undefined) { const p = D.P.get(sel), metrics = D.metrics.filter(m => $(`[data-ml="${CSS.escape(m.id)}"]`).checked || (ds.mlhow === m.id && el.value.trim())).map(m => ({ metric: m.id, how: $(`[data-mlhow="${CSS.escape(m.id)}"]`).value.trim() }));
     return queue({ op: 'set', entity: 'project', id: p.id, fields: { metrics } }, ds.ml !== undefined); }
   if (ds.pd !== undefined) { const p = D.P.get(sel); return queue({ op: 'set', entity: 'project', id: p.id, fields: { depends_on: $$('[data-pd]').filter(x => x.checked).map(x => x.dataset.pd) } }); }
@@ -423,6 +441,8 @@ function onChange(e) {
   if (act === 'feat') queue({ op: 'settings', fields: { features: { [ds.k]: el.checked } } });
   if (act === 'buffer' && el.value !== '') queue({ op: 'settings', fields: { date_buffer_days: Math.min(30, Math.max(0, parseInt(el.value, 10) || 0)) } }, false);
   if (act === 'org' && el.value.trim()) queue({ op: 'settings', fields: { org: el.value.trim() } }, false);
+  if (act === 'opstarget') queue({ op: 'settings', fields: { ops_target: el.value === '' ? null : Math.min(100, Math.max(0, parseInt(el.value, 10) || 0)) } }, false);
+  if (ds.cap !== undefined) queue({ op: 'settings', fields: { capacity: { [ds.cap]: el.value === '' ? null : Math.min(300, Math.max(0, parseInt(el.value, 10) || 0)) } } }, false);
 }
 function onClick(e) {
   const b = e.target.closest('[data-act]'); if (!b || b.tagName === 'SELECT' || b.tagName === 'INPUT') return; const ds = b.dataset;
