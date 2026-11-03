@@ -1,6 +1,8 @@
 /* Aurora dashboard core: shared by index.html (Leadership) and manage.html (Workbench).
-   Sign-in derives the AES key from username+password (same derivation as aurora.py), decrypts data.enc.json,
-   and derive() adds the computed views: health, progress, sequencing, critical path, people, alerts. */
+   Sign-in derives the AES key from email+password (same derivation as aurora.py), decrypts data.enc.json,
+   and derive() adds the computed views: health, progress, sequencing, critical path, people, staffing, alerts.
+   V2.3: transcripts can be opened in the browser (t/<meeting id>.json, decrypted with the transcript key from the
+   payload), provenance badges open the meeting they came from, and "Ask" (chat.js) gets its context from here. */
 'use strict';
 const A = window.A = {};
 const DATA_REPO = A.DATA_REPO = 'AuroraWDC/aurora-dashboard-data'; // private repo with transcripts and edits
@@ -16,6 +18,7 @@ A.fmtDate = d => d ? new Date(d + 'T12:00:00Z').toLocaleDateString(undefined, { 
 A.ST = { not_started: 'Not started', in_progress: 'In progress', blocked: 'Blocked', on_hold: 'On hold', completed: 'Completed', unknown: 'Unknown' };
 A.TS = { open: 'To do', in_progress: 'In progress', blocked: 'Blocked', done: 'Done' };
 A.HEALTH = { green: 'On track', amber: 'At risk', red: 'Off track', done: 'Delivered', paused: 'Paused' };
+A.KIND = { ops: 'Operational', innovation: 'Innovation' };   // work type: sustaining operations vs. new bets
 A.KINDS = {
   set_project_status: 'Change project status', set_project_owner: 'Assign project owner', set_priority: 'Set priority',
   set_task_owner: 'Assign a task', set_task_due: 'Set a due date', set_task_status: 'Change task status',
@@ -83,10 +86,10 @@ A.boot = async onReady => {
 function setMe(email) { A.me = { email, name: nameOf(email) }; }   // name is null for the old shared login
 function start(d, onReady) {
   $('#lock').hidden = true; $('#app').hidden = false; $('#nav').hidden = false;
-  const D = A._D = A.derive(A.normalize(d)); A.FB = d.feedback?.token ? d.feedback : null;
+  const D = A._D = A.derive(A.normalize(d)); A.FB = d.feedback?.token ? d.feedback : null; A.CHAT = d.chat?.key ? d.chat : null; A.TKEY = d.tkey || null;
   onReady(D); document.dispatchEvent(new CustomEvent('aurora:ready'));
 }
-A.refresh = async () => { const d = await openWith(AUTH, await fetchEnc()); A.FB = d.feedback?.token ? d.feedback : A.FB; return (A._D = A.derive(A.normalize(d))); };
+A.refresh = async () => { const d = await openWith(AUTH, await fetchEnc()); A.FB = d.feedback?.token ? d.feedback : A.FB; A.CHAT = d.chat?.key ? d.chat : A.CHAT; A.TKEY = d.tkey || A.TKEY; return (A._D = A.derive(A.normalize(d))); };
 A.currentProjectName = id => A._D?.P.get(id)?.name || A._D?.P.get(A._D.alias?.[id])?.name || null;
 A.signOut = () => { sessionStorage.clear(); location.href = location.pathname; };
 
@@ -94,10 +97,12 @@ A.signOut = () => { sessionStorage.clear(); location.href = location.pathname; }
 A.normalize = D => {
   D.settings = Object.assign({ org: 'Aurora WDC', features: {}, autonomy: {}, agent_enabled: false, auto_min_confidence: .75 }, D.settings || {});
   D.settings.features = Object.assign({ agile: false, waterfall: false }, D.settings.features);
+  D.settings.capacity = Object.assign({}, D.settings.capacity || {}); if (D.settings.ops_target == null) D.settings.ops_target = null;
   for (const k of ['metrics', 'decisions', 'conflicts', 'history', 'ops_applied', 'ops_log', 'agent_runs', 'op_errors', 'op_failures', 'meetings', 'deleted', 'users']) D[k] ||= [];
   D.projects.forEach((p, i) => {
     p.id ||= 'v1p' + i; p.tasks ||= []; p.milestones ||= []; p.metrics ||= []; p.depends_on ||= []; p._src ||= {}; p._lock ||= []; p._pre ||= {};
-    p.team = (p.team || []).map(t => typeof t === 'string' ? { name: t, role: '' } : t);
+    p.team = (p.team || []).map(t => typeof t === 'string' ? { name: t, role: '', alloc: null } : Object.assign({ alloc: null }, t));
+    if (!Object.hasOwn(p, 'kind')) p.kind = null; if (!Object.hasOwn(p, 'priority')) p.priority = null;
     for (const f of ['risks', 'assumptions', 'dependencies', 'metrics_mentioned', 'meetings']) p[f] ||= [];
     p.tasks.forEach((t, j) => { t.id ||= p.id + 't' + j; t.depends_on ||= []; t._src ||= {}; t._lock ||= []; t._pre ||= {}; t.first_seen ||= t.seen || ''; });
     p.milestones.forEach((m, j) => { m.id ||= p.id + 'm' + j; m._src ||= {}; m._lock ||= []; m._pre ||= {}; });
@@ -107,7 +112,8 @@ A.normalize = D => {
 };
 
 /* ---------- derived views ---------- */
-const pkey = n => String(n || '').trim().toLowerCase().replace(/\s+/g, ' ');
+const pkey = A.pkey = n => String(n || '').trim().toLowerCase().replace(/\s+/g, ' ');
+const ORDER_H = { red: 0, amber: 1, green: 2, paused: 3, done: 4 };
 A.derive = D => {
   const t0 = A.today(), stale = A.addDays(t0, -30);
   D.P = new Map(); D.T = new Map(); D.K = new Map(D.metrics.map(m => [m.id, m])); D.MT = new Map(D.meetings.map(m => [m.id, m]));
@@ -169,6 +175,27 @@ A.derive = D => {
   });
   D.people = [...ppl.values()].sort((a, b) => a.name.localeCompare(b.name));
   D.peopleNames = D.people.map(x => x.name);
+  // staffing: each team entry can carry alloc (% of that person's time); settings.capacity holds what each person can give (default 100).
+  // Projects are funded in priority order (P1 first); whatever falls past a person's capacity is "below the line" for them.
+  const capOf = n => { const k = pkey(n), hit = Object.keys(D.settings.capacity).find(c => pkey(c) === k); return hit != null ? D.settings.capacity[hit] : 100; };
+  const prank = p => (p.priority || 5) * 10 + ORDER_H[p.healthNow];
+  D.people.forEach(x => {
+    x.capacity = capOf(x.name);
+    const rows = D.active.filter(p => p.status !== 'completed').flatMap(p => p.team.filter(t => pkey(t.name) === pkey(x.name) && t.alloc != null).map(t => ({ p, alloc: +t.alloc })));
+    rows.sort((a, b) => prank(a.p) - prank(b.p) || a.p.name.localeCompare(b.p.name));
+    let cum = 0; rows.forEach(r => { cum += r.alloc; r.cum = cum; r.below = cum > x.capacity; });
+    x.plan = rows; x.alloc = cum; x.over = cum > x.capacity; x.unknownLoad = x.roles.size - rows.length;   // projects with no % recorded
+  });
+  const byName = new Map(D.people.map(x => [pkey(x.name), x]));
+  D.projects.forEach(p => {
+    p.staff = p.team.filter(t => t.alloc != null).map(t => { const x = byName.get(pkey(t.name)), r = x?.plan.find(r => r.p === p); return { name: t.name, role: t.role, alloc: +t.alloc, total: x?.alloc || 0, capacity: x?.capacity ?? 100, below: !!r?.below }; });
+    p.starvedBy = p.staff.filter(s => s.below).map(s => s.name);
+    p.staffNote = p.starvedBy.length ? `${p.starvedBy.join(', ')} ${p.starvedBy.length === 1 ? 'is' : 'are'} over capacity and this project is below their line` : '';
+  });
+  // work type split (operational vs. innovation) by project count and by staffed effort
+  D.split = { ops: { n: 0, alloc: 0 }, innovation: { n: 0, alloc: 0 }, none: { n: 0, alloc: 0 } };
+  D.active.filter(p => p.status !== 'completed').forEach(p => { const k = p.kind || 'none'; D.split[k].n++; D.split[k].alloc += p.staff.reduce((n, s) => n + s.alloc, 0); });
+  D.split.total = D.split.ops.alloc + D.split.innovation.alloc + D.split.none.alloc;
   // metrics: which projects move which metric
   D.metricLinks = new Map(D.metrics.map(m => [m.id, []]));
   D.active.forEach(p => p.metrics.forEach(l => D.metricLinks.get(l.metric)?.push({ p, how: l.how })));
@@ -177,6 +204,7 @@ A.derive = D => {
   D.active.forEach(p => {
     if (['completed'].includes(p.status)) return;
     if (!p.owner) D.alerts.push({ p, type: 'No owner', text: 'Project has no owner' });
+    if (p.starvedBy.length) D.alerts.push({ p, type: 'Capacity', text: p.staffNote });
     if (p.stale) D.alerts.push({ p, type: 'Stale', text: `Not discussed since ${A.fmtDate(p.updated)}` });
     p.lateMilestones.forEach(m => D.alerts.push({ p, type: 'Late milestone', text: `${m.title} (${A.fmtDate(m.date)})` }));
     p.open.forEach(t => {
@@ -196,13 +224,71 @@ A.progress = (v, label) => `<span class="prog" role="img" aria-label="${Math.rou
 A.who = n => n ? esc(n) : '<span class="mute">Unassigned</span>';
 A.srcLabel = s => !s ? '' : s.startsWith('human') ? 'Set by a person' : s.startsWith('agent') ? 'Set by the agent' : s.startsWith('meeting') ? 'From a meeting' : '';
 A.srcMark = (e, f) => { const s = e._src?.[f]; if (!s) return ''; const k = s.startsWith('human') ? 'h' : s.startsWith('agent') ? 'a' : 'm';
-  return `<abbr class="src src-${k}" title="${esc(A.srcLabel(s))}${e._lock?.includes(f) ? ' (locked)' : ''}">${{ h: 'P', a: 'A', m: 'M' }[k]}</abbr>`; };
+  const lock = e._lock?.includes(f) ? ' (locked)' : '';
+  if (k === 'm' && s.length > 8 && A._D?.MT.has(s.slice(8)))   // the meeting it came from can be opened
+    return `<button type="button" class="src src-m" data-meet="${esc(s.slice(8))}" data-q="${esc(String(['text', 'name', 'title', 'description'].includes(f) ? e[f] : (e.text ?? e.name ?? e.title ?? '')).slice(0, 80))}" title="From a meeting${lock}. Open the transcript">M</button>`;
+  return `<abbr class="src src-${k}" title="${esc(A.srcLabel(s))}${lock}">${{ h: 'P', a: 'A', m: 'M' }[k]}</abbr>`; };
+A.kindChip = p => p.kind ? `<span class="chip kind-${p.kind}">${A.KIND[p.kind]}</span>` : '';
+A.initials = n => String(n || '').split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0].toUpperCase()).join('');
 A.metricPct = m => {
   const b = +m.baseline || 0, t = +m.target, c = +m.current;
   if (!isFinite(t) || !isFinite(c) || m.target == null || m.current == null || t === b) return null;
   return Math.max(0, Math.min(1, (c - b) / (t - b)));
 };
 A.fmtNum = (v, unit) => v == null || v === '' ? '–' : (+v).toLocaleString(undefined, { maximumFractionDigits: 2 }) + (unit ? (unit === '%' ? '%' : ' ' + unit) : '');
+
+/* ---------- transcripts in the browser ----------
+   The pipeline publishes t/<meeting id>.json next to data.enc.json: the parsed transcript locked with the transcript
+   key, which signed-in users receive inside the payload. Loaded on demand and cached for this page. */
+const TX = new Map();
+A.transcript = async id => {
+  if (TX.has(id)) return TX.get(id);
+  if (!A.TKEY) throw new Error('notkey');
+  const r = await fetch(`t/${encodeURIComponent(id)}.json?t=${Date.now()}`, { cache: 'no-store' }); if (!r.ok) throw new Error('nofile');
+  const p = await r.json(), key = await crypto.subtle.importKey('raw', b64d(A.TKEY), 'AES-GCM', false, ['decrypt']);
+  const t = JSON.parse(new TextDecoder().decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64d(p.iv), additionalData: enc(id) }, key, b64d(p.ct))));
+  t.lines = []; for (const l of t.text.split('\n')) { const m = l.match(/^([^:]{1,60}):\s(.*)$/);   // continuation lines (no speaker) join the line above
+    if (m) t.lines.push({ who: m[1], text: m[2] }); else if (t.lines.length && l.trim()) t.lines[t.lines.length - 1].text += ' ' + l.trim(); else if (l.trim()) t.lines.push({ who: '', text: l }); }
+  TX.set(id, t); return t;
+};
+const words = q => [...new Set(String(q || '').toLowerCase().match(/[a-z0-9][a-z0-9'-]{2,}/g) || [])].filter(w => !STOP.has(w));
+const STOP = new Set('the and for are but not you all any can had her was one our out day get has him his how its may new now old see two way who boy did man men put say she too use with this that from they have what when will more been were would there their about which them into than then also just like some could other over such only very what\'s its'.split(' '));
+A.words = words;
+/* Score transcript lines against a question; returns passages (groups of lines) best first. */
+A.passages = (t, q, max = 6, span = 2) => {
+  const ws = words(q); if (!ws.length) return [];
+  const sc = t.lines.map(l => { const low = l.text.toLowerCase(); return ws.reduce((n, w) => n + (low.includes(w) ? 1 : 0), 0); });
+  const picks = sc.map((v, i) => [v, i]).filter(x => x[0] > 0).sort((a, b) => b[0] - a[0] || a[1] - b[1]).slice(0, max * 2);
+  const out = [], used = new Set();
+  for (const [, i] of picks) { if (used.has(i)) continue; const a = Math.max(0, i - span), b = Math.min(t.lines.length - 1, i + span);
+    for (let j = a; j <= b; j++) used.add(j); out.push({ at: i, lines: t.lines.slice(a, b + 1) }); if (out.length >= max) break; }
+  return out;
+};
+const mark = (text, ws) => { let h = esc(text); if (!ws.length) return h; const re = new RegExp('(' + ws.map(w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|') + ')', 'gi'); return h.replace(re, '<mark>$1</mark>'); };
+A.showMeeting = async (id, q = '') => {
+  const m = A._D?.MT.get(id); let box = $('#tmodal');
+  if (!box) { box = document.createElement('div'); box.id = 'tmodal'; box.setAttribute('role', 'dialog'); box.setAttribute('aria-modal', 'true'); box.setAttribute('aria-label', 'Meeting transcript'); document.body.append(box);
+    box.addEventListener('click', e => { if (e.target === box || e.target.closest('[data-tclose]')) close(); });
+    document.addEventListener('keydown', e => { if (e.key === 'Escape' && !box.hidden) close(); }); }
+  const close = () => { box.hidden = true; };
+  const render = (t, err) => {
+    const ws = words(q), voice = /voice-note/i.test(m?.file || '');
+    const hits = t ? t.lines.map((l, i) => ws.length && ws.some(w => l.text.toLowerCase().includes(w)) ? i : -1).filter(i => i >= 0) : [];
+    box.innerHTML = `<div class="tbox"><header><div><b>${voice ? 'Voice note' : 'Meeting'} of ${esc(A.fmtDate(m?.date || t?.date || ''))}</b> <span class="small mute">${esc(m?.file || id)}</span></div>
+      <span><button type="button" data-task class="small" ${A.CHAT ? '' : 'hidden'}>Ask about this meeting</button> <button type="button" data-tclose aria-label="Close">Close</button></span></header>
+      ${m?.summary ? `<p class="small">${esc(m.summary)}</p>` : ''}${m?.decisions?.length ? `<details class="small"><summary>Decisions recorded (${m.decisions.length})</summary><ul>${m.decisions.map(d => `<li>${esc(d)}</li>`).join('')}</ul></details>` : ''}
+      <div class="bar" style="margin:8px 0 4px"><input type="search" id="tq" value="${esc(q)}" placeholder="Find in transcript" aria-label="Find in transcript"><span class="small mute" id="tn">${ws.length ? `${hits.length} matching line${hits.length === 1 ? '' : 's'}` : ''}</span></div>
+      <div class="tbody" id="tbody">${err ? `<p class="empty">${esc(err)}</p>` : t.lines.map((l, i) => `<p id="tl${i}"${hits.includes(i) ? ' class="hit"' : ''}>${l.who ? `<b>${esc(l.who)}</b> ` : ''}${mark(l.text, ws)}</p>`).join('')}</div></div>`;
+    box.hidden = false;
+    $('#tq', box).oninput = e => { q = e.target.value; render(t, err); const n = $('#tq', box); n.focus(); n.setSelectionRange(n.value.length, n.value.length); };
+    $('[data-task]', box).onclick = () => { close(); document.dispatchEvent(new CustomEvent('aurora:ask', { detail: { kind: 'meeting', id } })); };
+    if (hits.length) $('#tl' + hits[0], box)?.scrollIntoView({ block: 'center' });
+  };
+  box.innerHTML = '<div class="tbox"><p class="mute">Opening transcript…</p></div>'; box.hidden = false;
+  try { render(await A.transcript(id)); }
+  catch (e) { render({ lines: [] }, e.message === 'notkey' ? 'Transcripts become readable here after the next pipeline run.' : e.message === 'nofile' ? 'This transcript has not been published to the site yet. It appears after the next pipeline run.' : 'Could not open this transcript.'); }
+};
+document.addEventListener('click', e => { const b = e.target.closest('[data-meet]'); if (b) { e.preventDefault(); A.showMeeting(b.dataset.meet, b.dataset.q || ''); } });
 
 /* Timeline (Gantt) as SVG. rows: {label, sub, start, end, cls, ms:[{date,title}], href} */
 A.gantt = (rows, opt = {}) => {
